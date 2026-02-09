@@ -1,164 +1,246 @@
 package org.firstinspires.ftc.teamcode.Atlas.Utils;
 
+import com.qualcomm.robotcore.hardware.ColorSensor;
 import com.qualcomm.robotcore.hardware.DcMotor;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
-import com.qualcomm.robotcore.hardware.Gamepad;
 import com.qualcomm.robotcore.hardware.HardwareMap;
+import com.qualcomm.robotcore.hardware.SwitchableLight;
+import com.qualcomm.robotcore.util.ElapsedTime;
 import com.qualcomm.robotcore.util.Range;
 
 public class AtlasFunctions {
+
+    public static class ShooterConfig {
+        public final double ticksPerRev;
+        public final double holdRpm;
+        public final double closeRpm;
+        public final double farRpm;
+
+        public ShooterConfig(double ticksPerRev, double holdRpm, double closeRpm, double farRpm) {
+            if (ticksPerRev <= 0) throw new IllegalArgumentException("ticksPerRev must be > 0");
+            this.ticksPerRev = ticksPerRev;
+            this.holdRpm = holdRpm;
+            this.closeRpm = closeRpm;
+            this.farRpm = farRpm;
+        }
+    }
+
+    public enum RangePreset { CLOSE, FAR }
+    public enum ShooterMode { OFF, HOLD, TARGET }
+    public enum IntakeMode { OFF, IN }
+    public enum IndexerMode { OFF, FEED, HOLD_REVERSE }
+
+    // ---------------- HARDWARE ----------------
 
     private final AtlasMecanumDrive drive;
 
     private final DcMotor indexer;
     private final DcMotor intake;
     private final DcMotorEx launcher;
-    private double launcherRPM = 1260;
-    private final double initialRPM = 1260;
-    private final double rpmStep = 10;
-    private final double maxRPM = 3000;
-    private final double minRPM = 1000;
 
-    private final double longRangeRPM = 1575;
+    private final ColorSensor launcherSensor;
+    private final SwitchableLight launcherSensorLight;
 
-    private boolean prevUp = false;
-    private boolean prevDown = false;
-    private boolean prevRight = false;
+    // ---------------- CONSTANTS ----------------
 
-    public AtlasFunctions(HardwareMap hardwareMap) {
+    private static final double INTAKE_PWR = 1.0;
+    private static final double INDEXER_FEED_PWR = 1.0;
+    private static final double INDEXER_HOLD_REVERSE_PWR = -0.10;
 
-        drive = new AtlasMecanumDrive(hardwareMap);
+    private static final double RPM_STEP = 25;
+    private static final double MAX_RPM = 3000;
+    private static final double MIN_RPM = 1000;
 
-        indexer = hardwareMap.get(DcMotor.class, "indexer");
-        intake = hardwareMap.get(DcMotor.class, "intake");
-        launcher = hardwareMap.get(DcMotorEx.class, "launcher");
+    private static final int SENSOR_ALPHA_THRESHOLD = 80; // tune
+    private static final double SENSOR_DEBOUNCE_MS = 60;
+
+    // ---------------- STATE ----------------
+
+    private final ShooterConfig cfg;
+
+    private RangePreset preset = RangePreset.CLOSE;
+
+    private ShooterMode shooterMode = ShooterMode.OFF;
+    private IntakeMode intakeMode = IntakeMode.OFF;
+    private IndexerMode indexerMode = IndexerMode.OFF;
+
+    private double manualAdjustRpm = 0.0;
+    private double targetRpm = 0.0;
+
+    private boolean elementRaw = false;
+    private boolean elementDebounced = false;
+    private final ElapsedTime sensorTimer = new ElapsedTime();
+
+    public AtlasFunctions(HardwareMap hw, ShooterConfig shooterCfg) {
+        cfg = shooterCfg;
+
+        drive = new AtlasMecanumDrive(hw);
+
+        indexer = hw.get(DcMotor.class, "INDEX_MOTOR");
+        intake = hw.get(DcMotor.class, "IMOTOR");
+        launcher = hw.get(DcMotorEx.class, "SMOTOR");
 
         indexer.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
         intake.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        launcher.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
 
         indexer.setDirection(DcMotor.Direction.FORWARD);
         intake.setDirection(DcMotor.Direction.REVERSE);
-
         launcher.setDirection(DcMotor.Direction.REVERSE);
 
+        indexer.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        intake.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        launcher.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.FLOAT);
+
+        launcherSensor = hw.get(ColorSensor.class, "COLOR_SENSOR");
+        launcherSensorLight = (launcherSensor instanceof SwitchableLight) ? (SwitchableLight) launcherSensor : null;
+        if (launcherSensorLight != null) launcherSensorLight.enableLight(true);
+
+        sensorTimer.reset();
         stopAll();
     }
 
     // ---------------- DRIVE ----------------
 
-    public void drive(Gamepad gp) {
+    public void drive(com.qualcomm.robotcore.hardware.Gamepad gp) {
         drive.drive(gp);
     }
 
-    public void setDriveMode(AtlasMecanumDrive.DriveMode mode) {
-        drive.setDriveMode(mode);
+    public void drive(com.qualcomm.robotcore.hardware.Gamepad gp, double driveScale, double turnScale) {
+        drive.drive(gp, driveScale, turnScale);
     }
 
-    public AtlasMecanumDrive.DriveMode getDriveMode() {
-        return drive.getDriveMode();
-    }
+    public void setDriveMode(AtlasMecanumDrive.DriveMode mode) { drive.setDriveMode(mode); }
+    public AtlasMecanumDrive.DriveMode getDriveMode() { return drive.getDriveMode(); }
+    public double getHeadingRad() { return drive.getHeadingRad(); }
 
-    public double getHeadingRad() {
-        return drive.getHeadingRad();
+    // ---------------- PRESETS ----------------
+
+    public void setPreset(RangePreset p) { preset = p; }
+    public RangePreset getPreset() { return preset; }
+
+    public double getPresetRpm() {
+        return (preset == RangePreset.FAR) ? cfg.farRpm : cfg.closeRpm;
     }
 
     // ---------------- RPM ADJUSTMENT ----------------
 
-    public void updateRPMAdjust(Gamepad gp) {
+    public double getRpmStep() { return RPM_STEP; }
 
-        if (gp.dpad_up && !prevUp) {
-            launcherRPM += rpmStep;
-            launcherRPM = Range.clip(launcherRPM, minRPM, maxRPM);
-            gp.rumble(200);
-        }
-        prevUp = gp.dpad_up;
+    public void nudgeManualAdjustRpm(double delta) {
+        manualAdjustRpm += delta;
+    }
 
-        if (gp.dpad_down && !prevDown) {
-            launcherRPM -= rpmStep;
-            launcherRPM = Range.clip(launcherRPM, minRPM, maxRPM);
-            gp.rumble(200);
-        }
-        prevDown = gp.dpad_down;
+    public void resetManualAdjustRpm() { manualAdjustRpm = 0.0; }
+    public double getManualAdjustRpm() { return manualAdjustRpm; }
 
-        if (gp.dpad_right && !prevRight) {
-            launcherRPM = initialRPM;
-            gp.rumbleBlips(2);
-        }
-        prevRight = gp.dpad_right;
+    public double getSelectedTargetRpm() {
+        double rpm = getPresetRpm() + manualAdjustRpm;
+        return Range.clip(rpm, MIN_RPM, MAX_RPM);
     }
 
     // ---------------- SHOOTER ----------------
 
-    public void updateShooter(Gamepad gp) {
-
-        if (gp.right_bumper) {
-            setShooterVelocity(longRangeRPM);
-        } else if (gp.right_trigger > 0.5) {
-            setShooterVelocity(launcherRPM);
-        } else {
-            setShooterVelocity(0);
-        }
+    public void shooterHold() {
+        shooterMode = ShooterMode.HOLD;
+        targetRpm = cfg.holdRpm;
+        launcher.setVelocity(rpmToTicksPerSec(targetRpm));
     }
 
-    private void setShooterVelocity(double v) {
-        launcher.setVelocity(v);
+    public void shooterTarget(double rpm) {
+        shooterMode = ShooterMode.TARGET;
+        targetRpm = Range.clip(rpm, MIN_RPM, MAX_RPM);
+        launcher.setVelocity(rpmToTicksPerSec(targetRpm));
     }
 
-    public void stopShooter() {
-        setShooterVelocity(0);
+    public void shooterOff() {
+        shooterMode = ShooterMode.OFF;
+        targetRpm = 0.0;
+        launcher.setVelocity(0);
+    }
+
+    public ShooterMode getShooterMode() { return shooterMode; }
+    public double getTargetRpm() { return targetRpm; }
+
+    public double getMeasuredTicksPerSec() { return launcher.getVelocity(); }
+
+    public double getMeasuredRpm() {
+        return ticksPerSecToRpm(getMeasuredTicksPerSec());
+    }
+
+    public double getRpmError() {
+        return targetRpm - getMeasuredRpm();
     }
 
     // ---------------- INTAKE ----------------
 
-    public void updateIntake(Gamepad gp) {
-
-        if (gp.left_trigger > 0.5) {
-            intake.setDirection(DcMotor.Direction.REVERSE);
-            intake.setPower(1);
-        } else {
-            intake.setPower(0);
-        }
+    public void intakeOn() {
+        intakeMode = IntakeMode.IN;
+        intake.setPower(INTAKE_PWR);
     }
 
-    public void stopIntake() {
+    public void intakeOff() {
+        intakeMode = IntakeMode.OFF;
         intake.setPower(0);
     }
 
+    public IntakeMode getIntakeMode() { return intakeMode; }
+    public double getIntakePower() { return intake.getPower(); }
+
     // ---------------- INDEXER ----------------
 
-    public void updateIndexer(Gamepad gp) {
+    public void indexerFeed() {
+        indexerMode = IndexerMode.FEED;
+        indexer.setPower(INDEXER_FEED_PWR);
+    }
 
-        if (gp.left_bumper) {
-            indexer.setDirection(DcMotor.Direction.FORWARD);
-            indexer.setPower(0.5);
-        } else {
-            indexer.setPower(0);
+    public void indexerHoldReverse() {
+        indexerMode = IndexerMode.HOLD_REVERSE;
+        indexer.setPower(INDEXER_HOLD_REVERSE_PWR);
+    }
+
+    public void indexerOff() {
+        indexerMode = IndexerMode.OFF;
+        indexer.setPower(0);
+    }
+
+    public IndexerMode getIndexerMode() { return indexerMode; }
+    public double getIndexerPower() { return indexer.getPower(); }
+
+    // ---------------- SENSOR ----------------
+
+    public void updateElementSensor() {
+        boolean now = launcherSensor.alpha() >= SENSOR_ALPHA_THRESHOLD;
+
+        if (now != elementRaw) {
+            elementRaw = now;
+            sensorTimer.reset();
+        }
+
+        if (sensorTimer.milliseconds() >= SENSOR_DEBOUNCE_MS) {
+            elementDebounced = elementRaw;
         }
     }
 
-    public void stopIndexer() {
-        indexer.setPower(0);
-    }
+    public int getSensorAlpha() { return launcherSensor.alpha(); }
+    public boolean getElementRaw() { return elementRaw; }
+    public boolean getElementDebounced() { return elementDebounced; }
 
     // ---------------- STOP ALL ----------------
 
     public void stopAll() {
-        stopShooter();
-        stopIntake();
-        stopIndexer();
+        shooterOff();
+        intakeOff();
+        indexerOff();
     }
 
-    // ---------------- GETTERS (telemetry) ----------------
+    // ---------------- CONVERSIONS ----------------
 
-    public double getLauncherRPM() {
-        return launcherRPM;
+    private double rpmToTicksPerSec(double rpm) {
+        return (rpm / 60.0) * cfg.ticksPerRev;
     }
 
-    public double getLongRangeRPM() {
-        return longRangeRPM;
-    }
-
-    public double getShooterVelocity() {
-        return launcher.getVelocity();
+    private double ticksPerSecToRpm(double tps) {
+        return (tps / cfg.ticksPerRev) * 60.0;
     }
 }

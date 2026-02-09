@@ -154,6 +154,37 @@ public class AtlasMecanumDrive {
             setMotorPowers(y, x, rx);
         }
     }
+    // ---------------- DRIVE (scaled) ----------------
+    public void drive(Gamepad gp, double driveScale, double turnScale) {
+
+        boolean l3 = gp.left_stick_button;
+        if (l3 && !prevL3) {
+            resetHeading();
+        }
+        prevL3 = l3;
+
+        driveScale = Range.clip(driveScale, 0.0, 1.0);
+        turnScale  = Range.clip(turnScale,  0.0, 1.0);
+
+        double y  = -applyDeadband(gp.left_stick_y, deadband) * driveScale;
+        double x  =  applyDeadband(gp.left_stick_x, deadband) * driveScale;
+        double rx =  applyDeadband(gp.right_stick_x, turnDeadband) * turnScale;
+
+        if (driveMode == DriveMode.FIELD_CENTRIC) {
+            double heading = getHeadingRad();
+
+            double cos = Math.cos(-heading);
+            double sin = Math.sin(-heading);
+
+            double rotX = x * cos - y * sin;
+            double rotY = x * sin + y * cos;
+
+            setMotorPowers(rotY, rotX, rx);
+        } else {
+            setMotorPowers(y, x, rx);
+        }
+    }
+
 
     /**
      * Robot centric helper.
