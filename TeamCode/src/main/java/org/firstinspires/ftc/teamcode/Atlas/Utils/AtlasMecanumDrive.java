@@ -197,18 +197,11 @@ public class AtlasMecanumDrive {
         headingOffsetRad = raw;
     }
 
-    /**
-     * Heading used for field centric, in radians.
-     */
     public double getHeadingRad() {
         double raw = getRawHeadingRad();
         return wrapRadians(raw - headingOffsetRad);
     }
 
-    /**
-     * Raw IMU yaw in radians, no offset applied.
-     * Returns 0 if no IMU found.
-     */
     public double getRawHeadingRad() {
         // New IMU API
         if (imuNew != null) {
