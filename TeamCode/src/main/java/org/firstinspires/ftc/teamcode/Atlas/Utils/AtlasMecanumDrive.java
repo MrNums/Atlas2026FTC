@@ -49,7 +49,7 @@ public class AtlasMecanumDrive {
     public double turnDeadband = 0.05;
     public double maxPower = 0.85;
     public AtlasMecanumDrive(HardwareMap hw) {
-        this(hw, "frontLeft", "frontRight", "backLeft", "backRight", "imu");
+        this(hw, "FL", "FR", "BL", "BR", "imu");
     }
     public AtlasMecanumDrive(
             HardwareMap hw,
