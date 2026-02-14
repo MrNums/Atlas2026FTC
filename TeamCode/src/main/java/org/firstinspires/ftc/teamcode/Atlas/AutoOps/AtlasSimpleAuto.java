@@ -9,141 +9,86 @@ import org.firstinspires.ftc.teamcode.Atlas.Utils.AtlasFunctions;
 @Autonomous(name = "Atlas RED Simple Auto RED", group = "Auto")
 public class AtlasSimpleAuto extends OpMode {
 
+    private enum State { DRIVE_OUT, TURN_TO_GOAL, SPIN_UP, SHOOT, PARK, DONE }
+
+    private final ElapsedTime timer = new ElapsedTime();
     private AtlasFunctions fn;
-    private ElapsedTime t = new ElapsedTime();
+    private State state = State.DRIVE_OUT;
+    private int shots;
 
-    private enum State {
-        FORWARD,
-        TURN,
-        SPINUP,
-        SHOOT,
-        TURN2,
-        FORWARD2,
-        DONE
-    }
+    private static final double DRIVE_POWER = 0.40;
+    private static final long DRIVE_MS = 450;
+    private static final double TURN_POWER = -0.45;
+    private static final long TURN_MS = 350;
 
-    private State state = State.FORWARD;
-
-    // DRIVE
-    private static final double FORWARD_PWR = 0.4;
-    private static final long   FORWARD_MS  = 400;
-
-    private static final double TURN_PWR = 0.5;
-    private static final double TURN_DEG = -15.0;
-    private static final double TURN_DEG2 = -1.0;
-
-    // SHOOTING
-    private static final double READY_ERR_RPM = 150;
-
-    private static final int SHOTS = 4;
-    private static final long FEED_MS = 235;
-    private static final long GAP_MS  = 600;
-
-    private int shotCount = 0;
+    private static final int TOTAL_SHOTS = 4;
+    private static final double READY_ERR_RPM = 170;
+    private static final long FEED_MS = 240;
+    private static final long GAP_MS = 450;
 
     @Override
     public void init() {
-
-        AtlasFunctions.ShooterConfig cfg =
-                new AtlasFunctions.ShooterConfig(
-                        28,
-                        1500,
-                        2800,
-                        3250
-                );
-
-        fn = new AtlasFunctions(hardwareMap, cfg);
+        fn = new AtlasFunctions(hardwareMap, new AtlasFunctions.ShooterConfig(28, 1500, 2800, 3250));
     }
 
     @Override
     public void start() {
-        t.reset();
-        shotCount = 0;
-        state = State.FORWARD;
         fn.stopAll();
+        fn.setPreset(AtlasFunctions.RangePreset.FAR);
+        state = State.DRIVE_OUT;
+        shots = 0;
+        timer.reset();
     }
 
     @Override
     public void loop() {
-
         switch (state) {
-
-            case FORWARD:
-
-                fn.driveForward(FORWARD_PWR);
-
-                if (t.milliseconds() >= FORWARD_MS) {
-                    fn.stopDrive();
-                    t.reset();
-                    state = State.TURN;
+            case DRIVE_OUT:
+                fn.driveForward(DRIVE_POWER);
+                if (timer.milliseconds() >= DRIVE_MS) {
+                    next(State.TURN_TO_GOAL);
                 }
-
                 break;
 
-            case TURN:
-
-                double headingDeg = Math.toDegrees(fn.getHeadingRad());
-
-                if (headingDeg > TURN_DEG) {
-                    fn.turn(TURN_PWR);
-                } else {
-                    fn.stopDrive();
-                    fn.setPreset(AtlasFunctions.RangePreset.FAR);
-                    t.reset();
-                    state = State.SPINUP;
+            case TURN_TO_GOAL:
+                fn.turn(TURN_POWER);
+                if (timer.milliseconds() >= TURN_MS) {
+                    next(State.SPIN_UP);
                 }
-
                 break;
 
-            case SPINUP:
-
+            case SPIN_UP:
                 fn.shooterTarget(fn.getSelectedTargetRpm());
-                fn.updateShooterPid();
-
                 if (Math.abs(fn.getRpmError()) <= READY_ERR_RPM) {
-                    t.reset();
-                    state = State.SHOOT;
+                    next(State.SHOOT);
                 }
-
                 break;
 
             case SHOOT:
-
                 fn.shooterTarget(fn.getSelectedTargetRpm());
-                fn.updateShooterPid();
                 fn.intakeOn();
 
-                if (shotCount >= SHOTS) {
+                if (shots >= TOTAL_SHOTS) {
                     fn.indexerOff();
-                    t.reset();
-                    state = State.FORWARD2;
+                    next(State.PARK);
                     break;
                 }
 
-                double cycleTime = t.milliseconds();
-
-                if (cycleTime < FEED_MS) {
+                if (timer.milliseconds() < FEED_MS) {
                     fn.indexerFeed();
-                }
-                else if (cycleTime < FEED_MS + GAP_MS) {
+                } else if (timer.milliseconds() < FEED_MS + GAP_MS) {
                     fn.indexerOff();
+                } else {
+                    shots++;
+                    timer.reset();
                 }
-                else {
-                    shotCount++;
-                    t.reset();
-                }
-
                 break;
 
-            case FORWARD2:
-
-                fn.driveForward(FORWARD_PWR + 0.4);
-
-                if (t.milliseconds() >= FORWARD_MS) {
-                    fn.stopDrive();
-                    state = State.DONE;
+            case PARK:
+                fn.driveForward(0.60);
+                if (timer.milliseconds() >= DRIVE_MS) {
+                    next(State.DONE);
                 }
-
                 break;
 
             case DONE:
@@ -152,8 +97,14 @@ public class AtlasSimpleAuto extends OpMode {
         }
 
         telemetry.addData("State", state);
-        telemetry.addData("Heading", "%.1f", Math.toDegrees(fn.getHeadingRad()));
-        telemetry.addData("Shots", shotCount);
+        telemetry.addData("Shots", shots);
+        telemetry.addData("RPM err", "%.1f", fn.getRpmError());
         telemetry.update();
+    }
+
+    private void next(State next) {
+        fn.stopDrive();
+        timer.reset();
+        state = next;
     }
 }
