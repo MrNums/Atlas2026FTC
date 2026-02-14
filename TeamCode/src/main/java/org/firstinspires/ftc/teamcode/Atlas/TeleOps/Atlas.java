@@ -12,6 +12,7 @@ public class Atlas extends OpMode {
 
     private final ElapsedTime time = new ElapsedTime();
     private final ElapsedTime stateTimer = new ElapsedTime();
+    private final ElapsedTime shotTimer = new ElapsedTime();
 
     private AtlasFunctions fn;
 
@@ -29,10 +30,9 @@ public class Atlas extends OpMode {
     private boolean lastRight = false;
 
     private boolean lastY = false;
-
     private boolean lastElem = false;
 
-    private static final boolean USE_INDEXER_HOLD_REVERSE_WHEN_STAGED = false;
+    private static final boolean USE_INDEXER_HOLD_REVERSE_WHEN_STAGED = true;
 
     private static final double DRIVE_SCALE = 1.0;
     private static final double TURN_NORMAL = 1.0;
@@ -42,16 +42,23 @@ public class Atlas extends OpMode {
     private static final double RPM_RECOVER_PCT = 0.96;
 
     private static final double PAUSE_MS = 90;
-    private static final double MAX_FEED_MS = 900;
+    private static final double MAX_FEED_MS = 1500;
+
+    private static final double FEED_PULSE_MS = 350;
+    private static final double SHOT_GAP_MS   = 650;
+    private static final double RPM_FEED_PCT  = 0.90;
+
+    private static final double READY_ERR_ALLOW_CLOSE_RPM = 400;
+    private static final double READY_ERR_ALLOW_FAR_RPM   = 200;
 
     @Override
     public void init() {
 
         AtlasFunctions.ShooterConfig cfg = new AtlasFunctions.ShooterConfig(
-                28,     // HD Hex bare motor + Ultra 90deg gearbox (1:1)
-                1000,    // holdRpm
-                1350,   // closeRpm
-                1550    // farRpm
+                28,
+                1500,
+                2800,
+                3250
         );
 
         fn = new AtlasFunctions(hardwareMap, cfg);
@@ -64,6 +71,7 @@ public class Atlas extends OpMode {
     public void start() {
         time.reset();
         stateTimer.reset();
+        shotTimer.reset();
         fireState = FireState.IDLE;
         fn.stopAll();
     }
@@ -73,9 +81,12 @@ public class Atlas extends OpMode {
 
         // ---------------- INPUTS ----------------
 
-        boolean aimHeld = gamepad1.left_bumper;
-        boolean fireHeld = gamepad1.right_trigger > 0.5;
+        boolean aimHeld = gamepad1.left_bumper;          // aiming/spooling
+        boolean fireHeld = gamepad1.right_trigger > 0.5; // normal fire logic
         boolean intakeHeld = gamepad1.left_trigger > 0.5;
+        boolean reverseHeld = gamepad1.right_bumper;
+
+        boolean bypassFireHeld = gamepad1.x;
 
         boolean aNow = gamepad1.a;
         boolean bNow = gamepad1.b;
@@ -123,6 +134,9 @@ public class Atlas extends OpMode {
 
         fn.updateElementSensor();
         boolean elem = fn.getElementDebounced();
+        boolean elemRaw = fn.getElementRaw();
+        boolean elemSeen = fn.getElementSeenLatch();
+
         boolean elemRising = elem && !lastElem;
         lastElem = elem;
 
@@ -130,6 +144,23 @@ public class Atlas extends OpMode {
 
         if (aimHeld) fn.shooterTarget(fn.getSelectedTargetRpm());
         else fn.shooterHold();
+
+        fn.updateShooterPid();
+
+        // ---------------- BYPASS FIRE (aiming only) ----------------
+
+        if (aimHeld && bypassFireHeld) {
+            fn.intakeOn();
+            fn.indexerFeed();
+            fireState = FireState.IDLE;
+
+            telemetry.addLine("=== BYPASS FIRE (AIMING) ACTIVE ===");
+            telemetry.addData("Target", "%.1f", fn.getTargetRpm());
+            telemetry.addData("Meas", "%.1f", fn.getMeasuredRpm());
+            telemetry.addData("Err", "%.1f", fn.getRpmError());
+            telemetry.update();
+            return;
+        }
 
         // ---------------- INTAKE + INDEXER ----------------
 
@@ -142,22 +173,36 @@ public class Atlas extends OpMode {
             if (intakeHeld) {
                 fn.intakeOn();
 
-                if (!elem) {
-                    fn.indexerFeed();
+                boolean stagedOrSeen = elem || elemRaw || elemSeen;
+
+                if (!stagedOrSeen) {
+                    fn.indexerIntake();
                 } else {
                     if (USE_INDEXER_HOLD_REVERSE_WHEN_STAGED) fn.indexerHoldReverse();
                     else fn.indexerOff();
                 }
 
+                if (reverseHeld) {
+                    fn.indexerReverse();
+                    fn.intakeReverse();
+                }
+
             } else {
                 fn.intakeOff();
                 fn.indexerOff();
+                fn.clearElementSeenLatch();
             }
 
         } else {
 
             double target = fn.getTargetRpm();
             double meas = fn.getMeasuredRpm();
+
+            double err = target - meas; // positive means low
+
+            double errAllow = (fn.getPreset() == AtlasFunctions.RangePreset.CLOSE)
+                    ? READY_ERR_ALLOW_CLOSE_RPM
+                    : READY_ERR_ALLOW_FAR_RPM;
 
             switch (fireState) {
 
@@ -169,7 +214,14 @@ public class Atlas extends OpMode {
                 case READY:
                     fn.intakeOn();
                     fn.indexerOff();
-                    if (meas >= target * RPM_READY_PCT) {
+
+                    boolean cooldownOk = shotTimer.milliseconds() >= SHOT_GAP_MS;
+
+                    boolean atSpeedAbs = err <= errAllow;
+                    boolean atSpeedPct = meas >= target * RPM_FEED_PCT;
+
+                    if ((atSpeedAbs || atSpeedPct) && cooldownOk) {
+                        fn.clearElementSeenLatch();
                         fireState = FireState.FEEDING;
                         stateTimer.reset();
                     }
@@ -177,17 +229,18 @@ public class Atlas extends OpMode {
 
                 case FEEDING:
                     fn.intakeOn();
-                    fn.indexerFeed();
+
+                    if (stateTimer.milliseconds() <= FEED_PULSE_MS) {
+                        fn.indexerFeed();
+                    } else {
+                        fn.indexerOff();
+                        shotTimer.reset();
+                        fireState = FireState.PAUSE;
+                        stateTimer.reset();
+                    }
 
                     if (stateTimer.milliseconds() > MAX_FEED_MS) {
                         fireState = FireState.FAULT;
-                        stateTimer.reset();
-                        break;
-                    }
-
-                    if (elemRising) {
-                        fn.indexerOff();
-                        fireState = FireState.PAUSE;
                         stateTimer.reset();
                     }
                     break;
@@ -207,7 +260,7 @@ public class Atlas extends OpMode {
 
                     if (meas >= target * RPM_RECOVER_PCT) {
                         if (aimHeld && fireHeld) {
-                            fireState = FireState.FEEDING;
+                            fireState = FireState.READY;
                             stateTimer.reset();
                         } else {
                             fireState = FireState.IDLE;
@@ -245,9 +298,12 @@ public class Atlas extends OpMode {
 
         telemetry.addLine("=== Element ===");
         telemetry.addData("Alpha", fn.getSensorAlpha());
+        telemetry.addData("Dist(mm)", "%.1f", fn.getSensorDistanceMm());
         telemetry.addData("Present", fn.getElementDebounced());
-        telemetry.addData("Intake", fn.getIntakeMode());
-        telemetry.addData("Indexer", fn.getIndexerMode());
+        telemetry.addData("Raw", fn.getElementRaw());
+        telemetry.addData("SeenLatch", fn.getElementSeenLatch());
+        telemetry.addData("RGB", "%d %d %d", fn.getSensorRed(), fn.getSensorGreen(), fn.getSensorBlue());
+        telemetry.addData("Type", fn.getArtifactType());
 
         telemetry.update();
     }

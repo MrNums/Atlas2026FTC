@@ -2,6 +2,7 @@ package org.firstinspires.ftc.teamcode.Atlas.Utils;
 
 import com.qualcomm.hardware.bosch.BNO055IMU;
 import com.qualcomm.robotcore.hardware.DcMotorEx;
+import com.qualcomm.robotcore.hardware.DcMotorSimple;
 import com.qualcomm.robotcore.hardware.Gamepad;
 import com.qualcomm.robotcore.hardware.HardwareMap;
 import com.qualcomm.robotcore.hardware.IMU;
@@ -14,23 +15,20 @@ import org.firstinspires.ftc.robotcore.external.navigation.Orientation;
 import org.firstinspires.ftc.robotcore.external.navigation.YawPitchRollAngles;
 
 /**
-    AtlasMecanumDrive
-    Supports Robot Centric and Field Centric drive.
-    Works with both IMU APIs:
-    1) New Control Hub IMU: com.qualcomm.robotcore.hardware.IMU
-    2) Older BNO055 IMU: com.qualcomm.hardware.bosch.BNO055IMU
-
-    Features
-    - Field centric with IMU heading
-    - Robot centric
-    - Reset orientation with L3 (left stick button) edge press
+ * AtlasMecanumDrive
+ *
+ * Goals:
+ * 1) Robot centric and field centric drive
+ * 2) Manual rotation only (right stick X). No auto-facing
+ * 3) Fix field centric jitter near +/- PI by using UNWRAPPED heading for math
+ * 4) Works with both IMU APIs:
+ *    - New Control Hub IMU: com.qualcomm.robotcore.hardware.IMU
+ *    - Old BNO055 IMU: com.qualcomm.hardware.bosch.BNO055IMU
+ * 5) L3 edge press resets heading (re-zero)
  */
 public class AtlasMecanumDrive {
 
-    public enum DriveMode {
-        ROBOT_CENTRIC,
-        FIELD_CENTRIC
-    }
+    public enum DriveMode { ROBOT_CENTRIC, FIELD_CENTRIC }
 
     private final DcMotorEx frontLeft;
     private final DcMotorEx frontRight;
@@ -40,29 +38,39 @@ public class AtlasMecanumDrive {
     private IMU imuNew = null;
     private BNO055IMU imuOld = null;
 
-    private double headingOffsetRad = 0.0;
-    private boolean prevL3 = false;
-
     private DriveMode driveMode = DriveMode.FIELD_CENTRIC;
 
+    // Tuning
     public double deadband = 0.05;
-    public double turnDeadband = 0.05;
+    public double turnDeadband = 0.08; // slightly higher to reduce drift-induced spin
     public double maxPower = 0.85;
+
+    // L3 edge detect
+    private boolean prevL3 = false;
+
+    // Heading offset (for both IMU types)
+    // IMPORTANT: We do NOT wrap heading for the field-centric transform.
+    // Wrapping near +/- PI causes sign flips and can jitter when facing "backwards".
+    private double headingOffsetRad = 0.0;
+
     public AtlasMecanumDrive(HardwareMap hw) {
         this(hw, "FL", "FR", "BL", "BR", "imu");
     }
+
     public AtlasMecanumDrive(
             HardwareMap hw,
             String flName, String frName, String blName, String brName,
             String imuName
     ) {
-        frontLeft = hw.get(DcMotorEx.class, flName);
+        frontLeft  = hw.get(DcMotorEx.class, flName);
         frontRight = hw.get(DcMotorEx.class, frName);
-        backLeft = hw.get(DcMotorEx.class, blName);
-        backRight = hw.get(DcMotorEx.class, brName);
+        backLeft   = hw.get(DcMotorEx.class, blName);
+        backRight  = hw.get(DcMotorEx.class, brName);
 
         setupMotors();
         initImu(hw, imuName);
+
+        // Set the current robot yaw as "zero"
         resetHeading();
     }
 
@@ -72,29 +80,24 @@ public class AtlasMecanumDrive {
         backLeft.setZeroPowerBehavior(DcMotorEx.ZeroPowerBehavior.BRAKE);
         backRight.setZeroPowerBehavior(DcMotorEx.ZeroPowerBehavior.BRAKE);
 
-        frontLeft.setDirection(DcMotorEx.Direction.REVERSE);
-        backLeft.setDirection(DcMotorEx.Direction.REVERSE);
-        frontRight.setDirection(DcMotorEx.Direction.FORWARD);
-        backRight.setDirection(DcMotorEx.Direction.FORWARD);
-
-        // If your robot drives backwards or strafes wrong, fix direction here first.
+        // These directions may need tuning for your wiring/mounting.
+        // Forward should drive forward. Strafe should strafe.
+        frontLeft.setDirection(DcMotorSimple.Direction.FORWARD);
+        frontRight.setDirection(DcMotorSimple.Direction.REVERSE);
+        backLeft.setDirection(DcMotorSimple.Direction.FORWARD);
+        backRight.setDirection(DcMotorSimple.Direction.REVERSE);
     }
 
     private void initImu(HardwareMap hw, String imuName) {
-        // Try new IMU first (newer SDK, newer Control Hub)
+        // Try new IMU API first
         try {
             imuNew = hw.get(IMU.class, imuName);
 
-            // Optional, but recommended: set the hub orientation if your Control Hub is mounted differently.
-            // If you do not set it, heading might be rotated by 90 or 180 degrees.
-            // Example (only if you know your mounting):
-            // IMU.Parameters params = new IMU.Parameters(new RevHubOrientationOnRobot(
-            //         RevHubOrientationOnRobot.LogoFacingDirection.UP,
-            //         RevHubOrientationOnRobot.UsbFacingDirection.FORWARD
-            // ));
-            // imuNew.initialize(params);
+            // If your Control Hub is mounted non-standard, you should initialize with hub orientation.
+            // Leaving this out assumes standard mounting.
+            // imuNew.initialize(new IMU.Parameters(new RevHubOrientationOnRobot(...)));
 
-            // If not initialized elsewhere, this is still safe to call.
+            // Reset yaw so raw reading starts near 0
             imuNew.resetYaw();
             return;
         } catch (Throwable ignored) {
@@ -113,7 +116,7 @@ public class AtlasMecanumDrive {
     }
 
     public void setDriveMode(DriveMode mode) {
-        this.driveMode = mode;
+        driveMode = mode;
     }
 
     public DriveMode getDriveMode() {
@@ -121,58 +124,39 @@ public class AtlasMecanumDrive {
     }
 
     /**
-     * Call every loop in TeleOp.
-     * Uses:
-     *  left stick: translation
-     *  right stick x: rotation
-     *  L3 edge press: reset heading
+     * Call every loop.
+     * Left stick: translation
+     * Right stick X: rotation (manual only)
+     * L3 edge press: reset field-centric heading
      */
     public void drive(Gamepad gp) {
-        // L3 to reset heading
-        boolean l3 = gp.left_stick_button;
-        if (l3 && !prevL3) {
-            resetHeading();
-        }
-        prevL3 = l3;
-
-        double y = -applyDeadband(gp.left_stick_y, deadband); // forward
-        double x = applyDeadband(gp.left_stick_x, deadband);  // strafe
-        double rx = applyDeadband(gp.right_stick_x, turnDeadband); // turn
-
-        if (driveMode == DriveMode.FIELD_CENTRIC) {
-            double heading = getHeadingRad();
-
-            // Rotate the joystick vector by negative heading
-            double cos = Math.cos(-heading);
-            double sin = Math.sin(-heading);
-
-            double rotX = x * cos - y * sin;
-            double rotY = x * sin + y * cos;
-
-            setMotorPowers(rotY, rotX, rx);
-        } else {
-            setMotorPowers(y, x, rx);
-        }
+        drive(gp, 1.0, 1.0);
     }
-    // ---------------- DRIVE (scaled) ----------------
-    public void drive(Gamepad gp, double driveScale, double turnScale) {
 
+    /**
+     * Call every loop with scaling.
+     */
+    public void drive(Gamepad gp, double driveScale, double turnScale) {
+        // L3 edge press -> reset heading
         boolean l3 = gp.left_stick_button;
-        if (l3 && !prevL3) {
-            resetHeading();
-        }
+        if (l3 && !prevL3) resetHeading();
         prevL3 = l3;
 
         driveScale = Range.clip(driveScale, 0.0, 1.0);
         turnScale  = Range.clip(turnScale,  0.0, 1.0);
 
-        double y  = -applyDeadband(gp.left_stick_y, deadband) * driveScale;
-        double x  =  applyDeadband(gp.left_stick_x, deadband) * driveScale;
-        double rx =  applyDeadband(gp.right_stick_x, turnDeadband) * turnScale;
+        // Translation (left stick)
+        double y = -applyDeadband(gp.left_stick_y, deadband) * driveScale; // forward
+        double x =  applyDeadband(gp.left_stick_x, deadband) * driveScale; // strafe
+
+        // Rotation (right stick X) - manual only
+        double rx = applyDeadband(gp.right_stick_x, turnDeadband) * turnScale;
 
         if (driveMode == DriveMode.FIELD_CENTRIC) {
-            double heading = getHeadingRad();
+            // IMPORTANT: use UNWRAPPED heading for math to avoid +/-PI jitter.
+            double heading = getHeadingRadUnwrapped();
 
+            // Rotate joystick vector by -heading
             double cos = Math.cos(-heading);
             double sin = Math.sin(-heading);
 
@@ -185,9 +169,8 @@ public class AtlasMecanumDrive {
         }
     }
 
-
     /**
-     * Robot centric helper.
+     * Mecanum mixing.
      */
     private void setMotorPowers(double y, double x, double rx) {
         double fl = y + x + rx;
@@ -211,30 +194,47 @@ public class AtlasMecanumDrive {
         backRight.setPower(Range.clip(br, -1.0, 1.0));
     }
 
+    /**
+     * Re-zero the heading.
+     * Works for both IMUs. If new IMU exists, we try resetYaw for cleaner behavior.
+     */
     public void resetHeading() {
         double raw = getRawHeadingRad();
 
-        // If new IMU is present, you can also call resetYaw.
-        // We still keep offset logic so it works consistently.
         if (imuNew != null) {
             try {
                 imuNew.resetYaw();
                 raw = 0.0;
             } catch (Throwable ignored) {
-                // offset will handle it
+                // keep raw, offset logic still works
             }
         }
 
         headingOffsetRad = raw;
     }
-
-    public double getHeadingRad() {
-        double raw = getRawHeadingRad();
-        return wrapRadians(raw - headingOffsetRad);
+    public void driveRobotCentric(double y, double x, double rx) {
+        setMotorPowers(y, x, rx);
     }
 
+    /**
+     * Heading used for field-centric math.
+     * UNWRAPPED value (no wrapRadians) to avoid discontinuity at +/- PI.
+     */
+    public double getHeadingRadUnwrapped() {
+        return getRawHeadingRad() - headingOffsetRad;
+    }
+
+    /**
+     * Wrapped heading (nice for telemetry, not recommended for control math).
+     */
+    public double getHeadingRadWrapped() {
+        return wrapRadians(getHeadingRadUnwrapped());
+    }
+
+    /**
+     * Raw IMU yaw in radians.
+     */
     public double getRawHeadingRad() {
-        // New IMU API
         if (imuNew != null) {
             try {
                 YawPitchRollAngles ypr = imuNew.getRobotYawPitchRollAngles();
@@ -242,7 +242,6 @@ public class AtlasMecanumDrive {
             } catch (Throwable ignored) { }
         }
 
-        // Old BNO055 API
         if (imuOld != null) {
             try {
                 Orientation o = imuOld.getAngularOrientation(
@@ -250,15 +249,18 @@ public class AtlasMecanumDrive {
                         AxesOrder.ZYX,
                         org.firstinspires.ftc.robotcore.external.navigation.AngleUnit.RADIANS
                 );
-                return o.firstAngle; // yaw
+                return o.firstAngle;
             } catch (Throwable ignored) { }
         }
 
         return 0.0;
     }
+    public void driveDirect(double y, double x, double rx) {
+        setMotorPowers(y, x, rx);
+    }
 
-    private static double applyDeadband(double v, double db) {
-        return Math.abs(v) < db ? 0.0 : v;
+    public static double applyDeadband(double v, double db) {
+        return (Math.abs(v) < db) ? 0.0 : v;
     }
 
     private static double wrapRadians(double r) {
